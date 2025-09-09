@@ -110,6 +110,10 @@
 #include <net/busy_poll.h>
 #include <linux/errqueue.h>
 
+#ifdef CONFIG_OPLUS_NWPOWER
+#include <net/oplus_nwpower.h>
+#endif
+
 /* proto_ops for ipv4 and ipv6 use the same {recv,send}msg function */
 #if IS_ENABLED(CONFIG_INET)
 #define INDIRECT_CALL_INET4(f, f1, ...) INDIRECT_CALL_1(f, f1, __VA_ARGS__)
@@ -421,6 +425,10 @@ static struct file_system_type sock_fs_type = {
 struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 {
 	struct file *file;
+#ifdef CONFIG_OPLUS_NWPOWER
+	struct pid *pid;
+	struct task_struct *task;
+#endif
 
 	if (!dname)
 		dname = sock->sk ? sock->sk->sk_prot_creator->name : "";
@@ -435,6 +443,22 @@ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 
 	sock->file = file;
 	file->private_data = sock;
+#ifdef CONFIG_OPLUS_NWPOWER
+	pid = find_get_pid(current->tgid);
+	if (pid) {
+		task = get_pid_task(pid, PIDTYPE_PID);
+		if (task && sock->sk) {
+			strncpy(sock->sk->sk_cmdline, task->comm, TASK_COMM_LEN);
+			sock->sk->sk_cmdline[TASK_COMM_LEN - 1] = 0;
+		}
+		put_task_struct(task);
+	}
+	put_pid(pid);
+
+	if (sock->sk) {
+		sock->sk->sk_oplus_pid = current->tgid;
+	}
+#endif
 	return file;
 }
 EXPORT_SYMBOL(sock_alloc_file);
@@ -1824,6 +1848,10 @@ int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
 	if (err < 0)
 		goto out_put;
 
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_OUTPUT, sock))
+		return -EACCES;
+#endif
 	err =
 	    security_socket_connect(sock, (struct sockaddr *)&address, addrlen);
 	if (err)
@@ -1941,6 +1969,11 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
 	if (!sock)
 		goto out;
 
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_OUTPUT, sock))
+		return -EACCES;
+#endif
+
 	msg.msg_name = NULL;
 	msg.msg_control = NULL;
 	msg.msg_controllen = 0;
@@ -2001,6 +2034,11 @@ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (!sock)
 		goto out;
+
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_INPUT, sock))
+		return err;
+#endif
 
 	msg.msg_control = NULL;
 	msg.msg_controllen = 0;
@@ -2355,6 +2393,11 @@ long __sys_sendmsg(int fd, struct user_msghdr __user *msg, unsigned int flags,
 	if (!sock)
 		goto out;
 
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_OUTPUT, sock))
+		return -EACCES;
+#endif
+
 	err = ___sys_sendmsg(sock, msg, &msg_sys, flags, NULL, 0);
 
 	fput_light(sock->file, fput_needed);
@@ -2396,6 +2439,12 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
 
 	used_address.name_len = UINT_MAX;
 	entry = mmsg;
+
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_OUTPUT, sock))
+		return -EACCES;
+#endif
+
 	compat_entry = (struct compat_mmsghdr __user *)mmsg;
 	err = 0;
 	flags |= MSG_BATCH;
@@ -2528,6 +2577,11 @@ long __sys_recvmsg(int fd, struct user_msghdr __user *msg, unsigned int flags,
 	if (!sock)
 		goto out;
 
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_INPUT, sock))
+		return err;
+#endif
+
 	err = ___sys_recvmsg(sock, msg, &msg_sys, flags, 0);
 
 	fput_light(sock->file, fput_needed);
@@ -2566,6 +2620,11 @@ int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (!sock)
 		return err;
+
+#ifdef CONFIG_OPLUS_NWPOWER
+	if(oplus_check_socket_in_blacklist(OPLUS_NET_INPUT, sock))
+		return err;
+#endif
 
 	if (likely(!(flags & MSG_ERRQUEUE))) {
 		err = sock_error(sock->sk);
