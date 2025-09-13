@@ -181,7 +181,7 @@ struct netns_ipv4 {
 	int sysctl_udp_rmem_min;
 
 	int sysctl_fib_notify_on_flag_change;
-#ifdef CONFIG_E404_OPLUS
+#ifdef CONFIG_OPLUS_PORT
 	int sysctl_tcp_random_timestamp;
 #endif
 
