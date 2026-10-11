@@ -7,9 +7,10 @@
 #define _LINUX_BINDER_ALLOC_H
 
 #include <linux/rbtree.h>
+#include <linux/spinlock.h>
 #include <linux/list.h>
 #include <linux/mm.h>
-#include <linux/spinlock.h>
+#include <linux/rtmutex.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/list_lru.h>
@@ -144,6 +145,7 @@ void binder_alloc_print_allocated(struct seq_file *m,
 				  struct binder_alloc *alloc);
 void binder_alloc_print_pages(struct seq_file *m,
 			      struct binder_alloc *alloc);
+
 extern int binder_buffer_pool_create(void);
 extern void binder_buffer_pool_destroy(void);
 
