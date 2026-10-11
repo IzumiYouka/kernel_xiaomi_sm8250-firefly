@@ -142,8 +142,8 @@ static void binder_selftest_free_page(struct binder_alloc *alloc)
 {
 	int i;
 	unsigned long count;
-	while ((count = list_lru_count(&binder_alloc_lru))) {
-		list_lru_walk(&binder_alloc_lru, binder_alloc_free_page,
+	while ((count = list_lru_count(&binder_freelist))) {
+		list_lru_walk(&binder_freelist, binder_alloc_free_page,
 			      NULL, count);
 	}
 	for (i = 0; i < (alloc->buffer_size / PAGE_SIZE); i++) {
@@ -163,7 +163,7 @@ static void binder_selftest_alloc_free(struct binder_alloc *alloc,
 	binder_selftest_free_buf(alloc, buffers, sizes, seq, end);
 	/* Allocate from lru. */
 	binder_selftest_alloc_buf(alloc, buffers, sizes, seq);
-	if (list_lru_count(&binder_alloc_lru))
+	if (list_lru_count(&binder_freelist))
 		pr_err("lru list should be empty but is not\n");
 	binder_selftest_free_buf(alloc, buffers, sizes, seq, end);
 	binder_selftest_free_page(alloc);

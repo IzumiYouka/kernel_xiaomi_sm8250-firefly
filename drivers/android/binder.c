@@ -2443,7 +2443,7 @@ static int binder_fixup_parent(struct binder_transaction *t,
 				  proc->pid, thread->pid);
 		return -EINVAL;
 	}
-        buffer_offset = bp->parent_offset + parent->buffer - b->user_data;
+	buffer_offset = bp->parent_offset + parent->buffer - b->user_data;
 	if (binder_alloc_copy_to_buffer(&target_proc->alloc, b, buffer_offset,
 					&bp->buffer, sizeof(bp->buffer))) {
 		binder_user_error("%d:%d got transaction with invalid parent offset\n",
@@ -2976,7 +2976,7 @@ static void binder_transaction(struct binder_proc *proc,
 				    ALIGN(tr->offsets_size, sizeof(void *)) +
 				    ALIGN(extra_buffers_size, sizeof(void *)) -
 				    ALIGN(secctx_sz, sizeof(u64));
-                t->security_ctx = t->buffer->user_data + buf_offset;
+		t->security_ctx = t->buffer->user_data + buf_offset;
 		err = binder_alloc_copy_to_buffer(&target_proc->alloc,
 						  t->buffer, buf_offset,
 						  secctx, secctx_sz);
