@@ -51,17 +51,15 @@ struct sugov_policy {
 	bool			need_freq_update;
 
 	/*
-	 * Double-buffered DVFS headroom lookup table, indexed by absolute
-	 * utilization (0..SCHED_CAPACITY_SCALE) and holding the headroom to
-	 * add for this policy's nominal CPU capacity. A rebuild always fills
-	 * the inactive buffer and publishes it via dvfs_headroom_lut_cur with
-	 * smp_store_release(), so hot-path readers using smp_load_acquire()
-	 * observe either the previous complete table or the new complete
-	 * table, never a partially written one.
+	 * DVFS headroom lookup table, indexed by absolute utilization
+	 * (0..SCHED_CAPACITY_SCALE) and holding the headroom to add for this
+	 * policy's nominal CPU capacity.
+	 *
+	 * Built once in sugov_start() before any update-util hook is published,
+	 * and never rebuilt: the delay it is derived from is a compile-time
+	 * constant, so no writer can race the lock-free readers.
 	 */
-	u16			dvfs_headroom_lut[2][SCHED_CAPACITY_SCALE + 1];
-	u16			*dvfs_headroom_lut_cur;
-	int			dvfs_headroom_lut_next;
+	u16			dvfs_headroom_lut[SCHED_CAPACITY_SCALE + 1];
 };
 
 struct sugov_cpu {
@@ -450,7 +448,6 @@ static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util, int cp
 {
 	struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
-	const u16 *lut;
 	unsigned long headroom, cap;
 	unsigned int limit_level, scale;
 
@@ -460,10 +457,6 @@ static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util, int cp
 	if (util > SCHED_CAPACITY_SCALE)
 		util = SCHED_CAPACITY_SCALE;
 
-	lut = smp_load_acquire(&sg_policy->dvfs_headroom_lut_cur);
-	if (!lut)
-		return util;
-
 	/*
 	 * Use the static CPU capacity: this helper is also called from the
 	 * EAS energy estimation, which must not depend on a previous
@@ -471,7 +464,7 @@ static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util, int cp
 	 */
 	cap = arch_scale_cpu_capacity(cpu);
 
-	headroom = lut[util];
+	headroom = sg_policy->dvfs_headroom_lut[util];
 
 	/* User scaling, in percent of the PELT-growth ideal */
 	scale = READ_ONCE(sysctl_sched_hr_scale);
@@ -706,10 +699,8 @@ static ssize_t rate_limit_us_store(struct gov_attr_set *attr_set,
 	rate_limit_us = max(rate_limit_us, SUGOV_RATE_LIMIT_MIN_US);
 	tunables->rate_limit_us = rate_limit_us;
 
-	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sg_policy->freq_update_delay_ns = rate_limit_us * NSEC_PER_USEC;
-		sugov_build_dvfs_headroom_lut(sg_policy);
-	}
 
 	return count;
 }
@@ -839,25 +830,20 @@ static void sugov_build_dvfs_headroom_lut(struct sugov_policy *sg_policy)
 	unsigned long util;
 	unsigned int alpha;
 	u64 delay;
-	u16 *new_lut;
-	int next;
 
 	/*
 	 * The utilization can only be re-sampled at the governor rate limit
-	 * or at the next tick, whichever comes later.
+	 * or at the next tick, whichever comes later. The rate limit the table
+	 * is derived from is taken at sugov_start(), when the tunable still
+	 * holds the driver's default; a rate_limit_us written later only
+	 * affects the governor's decision points, not the table.
 	 */
 	delay = max_t(u64, sg_policy->tunables->rate_limit_us, TICK_USEC);
 	alpha = sugov_pelt_alpha(delay);
 
-	next = sg_policy->dvfs_headroom_lut_next;
-	new_lut = sg_policy->dvfs_headroom_lut[next];
-
 	for (util = 0; util <= SCHED_CAPACITY_SCALE; util++)
-		new_lut[util] = (u16)calc_dvfs_headroom(util, cap, alpha);
-
-	/* Publish the fully populated table before any reader can see it. */
-	smp_store_release(&sg_policy->dvfs_headroom_lut_cur, new_lut);
-	sg_policy->dvfs_headroom_lut_next = !next;
+		sg_policy->dvfs_headroom_lut[util] =
+			(u16)calc_dvfs_headroom(util, cap, alpha);
 }
 
 static struct sugov_policy *sugov_policy_alloc(struct cpufreq_policy *policy)
