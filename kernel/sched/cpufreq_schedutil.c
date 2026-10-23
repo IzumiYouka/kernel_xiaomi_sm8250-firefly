@@ -779,28 +779,38 @@ static struct cpufreq_governor schedutil_gov;
  * DVFS headroom from PELT growth.
  *
  * h_max is the utilization a fully busy CPU can gain during one governor
- * delay window, and approximate_util_avg(u, delay) is where a CPU sitting
- * at @u will be after that same window. Both come straight out of
+ * delay window, and approx is where a CPU sitting at @util will be after
+ * that same window. Both come straight out of
  * accumulate_sum()/approximate_util_avg() in pelt.c, so the curve follows
  * the configured PELT half-life and the EAS ramp-up path instead of being a
  * hand-tuned polynomial.
  *
- * Ideal headroom, treating alpha = h_max / 1024 as the fraction of a CPU's
- * capacity that can be consumed in one window:
+ * Let g = approx - util be the growth this CPU can still undergo during the
+ * window. The headroom is that growth, capped at the fraction of capacity a
+ * full window could consume:
  *
- *   growth = h_max * C / 1024        (= C * alpha)
- *   decay  = h_max + u - approx(u)  (= u * alpha)
- *   H      = max(0, growth - decay)
+ *   ceiling = C * h_max / 1024        (= C * alpha)
+ *   H       = min(g, ceiling)
+ *
+ * Scaling the ceiling with C rather than subtracting a constant penalty
+ * keeps small cores usable: a fixed h_max * (1024 - C) / 1024 term is
+ * proportionally far harsher on a 253-capacity silver than on the 1024
+ * prime, which used to starve them of headroom entirely.
  */
 static unsigned long calc_dvfs_headroom(unsigned long util, unsigned long cap,
 					unsigned long h_max, unsigned long approx)
 {
-	s64 growth, decay;
+	unsigned long growth, ceiling;
+	s64 g;
 
-	growth = (s64)((u64)h_max * cap >> SCHED_CAPACITY_SHIFT);
-	decay = (s64)h_max + (s64)util - (s64)approx;
+	g = (s64)approx - (s64)util;
+	if (g <= 0)
+		return 0;
 
-	return growth > decay ? (unsigned long)(growth - decay) : 0;
+	growth = (unsigned long)g;
+	ceiling = (u64)h_max * cap >> SCHED_CAPACITY_SHIFT;
+
+	return min(growth, ceiling);
 }
 
 static void sugov_build_dvfs_headroom_lut(struct sugov_policy *sg_policy)
