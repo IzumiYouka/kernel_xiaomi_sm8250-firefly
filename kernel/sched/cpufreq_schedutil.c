@@ -436,6 +436,10 @@ sugov_apply_response_time(unsigned long util, int cpu)
 	return mult * util >> SCHED_CAPACITY_SHIFT;
 }
 
+static unsigned long calc_dvfs_headroom(unsigned long util, unsigned long cap,
+					unsigned long h_max, unsigned long approx);
+static void sugov_build_dvfs_headroom_lut(struct sugov_policy *sg_policy);
+
 /**
  * sugov_apply_dvfs_headroom - Add DVFS headroom to a utilization value
  * @util: Utilization to add headroom to
@@ -450,6 +454,7 @@ static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util, int cp
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned long headroom, cap;
 	unsigned int limit_level, scale;
+	unsigned long h_max, approx;
 
 	if (!util)
 		return 0;
@@ -464,7 +469,10 @@ static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util, int cp
 	 */
 	cap = arch_scale_cpu_capacity(cpu);
 
-	headroom = sg_policy->dvfs_headroom_lut[util];
+	h_max = sg_policy->dvfs_headroom_lut[0];
+	approx = sg_policy->dvfs_headroom_lut[util];
+
+	headroom = calc_dvfs_headroom(util, cap, h_max, approx);
 
 	/* User scaling, in percent of the PELT-growth ideal */
 	scale = READ_ONCE(sysctl_sched_hr_scale);
@@ -677,8 +685,6 @@ static inline struct sugov_tunables *to_sugov_tunables(struct gov_attr_set *attr
 	return container_of(attr_set, struct sugov_tunables, attr_set);
 }
 
-static void sugov_build_dvfs_headroom_lut(struct sugov_policy *sg_policy);
-
 static ssize_t rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
@@ -770,65 +776,36 @@ static struct cpufreq_governor schedutil_gov;
  */
 
 /*
- * Rough estimate of how much the PELT utilization of a busy entity can
- * grow during @delay_us, expressed in SCHED_CAPACITY_SCALE units:
+ * DVFS headroom from PELT growth.
  *
- *   alpha = 1 - 2^(-periods / LOAD_AVG_PERIOD)
+ * h_max is the utilization a fully busy CPU can gain during one governor
+ * delay window, and approximate_util_avg(u, delay) is where a CPU sitting
+ * at @u will be after that same window. Both come straight out of
+ * accumulate_sum()/approximate_util_avg() in pelt.c, so the curve follows
+ * the configured PELT half-life and the EAS ramp-up path instead of being a
+ * hand-tuned polynomial.
  *
- * The generated runnable_avg_yN_inv[] table holds the decay factors as
- * 2^32 * 2^(-n/LOAD_AVG_PERIOD), so the configured PELT half-life
- * (8/16/32ms) is honored automatically.
- */
-static unsigned int sugov_pelt_alpha(u64 delay_us)
-{
-	unsigned int periods = DIV_ROUND_UP(delay_us, 1000);
-	unsigned int max_periods = ARRAY_SIZE(runnable_avg_yN_inv) - 1;
-	u64 inv;
-
-	if (periods > max_periods)
-		periods = max_periods;
-
-	inv = (u64)runnable_avg_yN_inv[periods] * SCHED_CAPACITY_SCALE;
-
-	return SCHED_CAPACITY_SCALE - div64_u64(inv, 1ULL << 32);
-}
-
-/*
- * Capacity-normalized cubic DVFS headroom:
+ * Ideal headroom, treating alpha = h_max / 1024 as the fraction of a CPU's
+ * capacity that can be consumed in one window:
  *
- *   x    = util / cap
- *   f(x) = 16 * x^2 * (1 - x)^2        (normalized to 1.0 at x = 0.5)
- *   H    = alpha * f(x) * cap
- *
- * The curve is zero on an idle CPU, rises smoothly to a peak at half
- * capacity and tapers back towards zero as the CPU saturates, where the
- * utilization itself already asks for the top OPP. Unlike a pure
- * (1 - x) taper it keeps enough mid-range boost to still reach fmax.
+ *   growth = h_max * C / 1024        (= C * alpha)
+ *   decay  = h_max + u - approx(u)  (= u * alpha)
+ *   H      = max(0, growth - decay)
  */
 static unsigned long calc_dvfs_headroom(unsigned long util, unsigned long cap,
-					unsigned int alpha)
+					unsigned long h_max, unsigned long approx)
 {
-	u64 xs, ps, f;
+	s64 growth, decay;
 
-	if (!util || !cap || util >= cap)
-		return 0;
+	growth = (s64)((u64)h_max * cap >> SCHED_CAPACITY_SHIFT);
+	decay = (s64)h_max + (s64)util - (s64)approx;
 
-	/* x in Q10: 0..1024 */
-	xs = (util << SCHED_CAPACITY_SHIFT) / cap;
-	ps = SCHED_CAPACITY_SCALE - xs;
-
-	/* f in Q10: 16 * x^2 * (1 - x)^2 / 1024^3, max 1024 at x = 512 */
-	f = ((16 * xs * xs) * (ps * ps)) >> (SCHED_CAPACITY_SHIFT * 3);
-
-	/* H = alpha * f * cap / 1024^2 */
-	return ((u64)alpha * f * cap) >> (SCHED_CAPACITY_SHIFT * 2);
+	return growth > decay ? (unsigned long)(growth - decay) : 0;
 }
 
 static void sugov_build_dvfs_headroom_lut(struct sugov_policy *sg_policy)
 {
-	unsigned long cap = arch_scale_cpu_capacity(sg_policy->policy->cpu);
 	unsigned long util;
-	unsigned int alpha;
 	u64 delay;
 
 	/*
@@ -839,11 +816,10 @@ static void sugov_build_dvfs_headroom_lut(struct sugov_policy *sg_policy)
 	 * affects the governor's decision points, not the table.
 	 */
 	delay = max_t(u64, sg_policy->tunables->rate_limit_us, TICK_USEC);
-	alpha = sugov_pelt_alpha(delay);
 
 	for (util = 0; util <= SCHED_CAPACITY_SCALE; util++)
 		sg_policy->dvfs_headroom_lut[util] =
-			(u16)calc_dvfs_headroom(util, cap, alpha);
+			(u16)approximate_util_avg(util, delay);
 }
 
 static struct sugov_policy *sugov_policy_alloc(struct cpufreq_policy *policy)
