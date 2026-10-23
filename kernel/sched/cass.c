@@ -30,7 +30,10 @@ struct cass_cpu_cand {
 	unsigned int exit_lat;
 	unsigned long cap;
 	unsigned long cap_max;
+	unsigned long cap_no_therm;
 	unsigned long cap_orig;
+	unsigned long eff_util;
+	unsigned long hard_util;
 	unsigned long util;
 };
 
@@ -53,21 +56,25 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	}
 
 	/*
-	 * Account for lost capacity due to time spent in RT/DL tasks and IRQs.
-	 * Capacity is considered lost to RT tasks even when @p is an RT task in
-	 * order to produce consistently balanced task placement results between
-	 * CFS and RT tasks when CASS selects a CPU for them. cap_max already
-	 * has the thermal throttling deducted.
-	 */
-	c->cap = c->cap_max - min(cpu_util_rt(rq) + cpu_util_dl(rq) +
-				  cpu_util_irq(rq), c->cap_max - 1);
-
-	/*
 	 * Deduct @current's util from this CPU if this is a sync wake, unless
 	 * @current is an RT task; RT tasks don't have per-entity load tracking.
 	 */
 	if (sync && c->cpu == this_cpu && !rt_task(current))
 		c->util -= min(c->util, task_util(current));
+
+	/* Get the utilization of everything other than CFS tasks */
+	c->hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
+
+	/*
+	 * Account for lost capacity due to time spent in RT/DL tasks and IRQs.
+	 * Capacity is considered lost to RT tasks even when @p is an RT task in
+	 * order to produce consistently balanced task placement results between
+	 * CFS and RT tasks when CASS selects a CPU for them.
+	 */
+	c->cap = c->cap_max - min(c->hard_util, c->cap_max - 1);
+
+	/* Get the current capacity with thermal pressure excluded */
+	c->cap_no_therm = c->cap_orig - min(c->hard_util, c->cap_orig - 1);
 }
 
 /*
@@ -97,6 +104,16 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
 	long res;
+
+	/* Prefer the CPU that's not overloaded */
+	if (cass_cmp(b->eff_util / b->cap_max, a->eff_util / a->cap_max))
+		goto done;
+
+	/* Prefer the CPU that's less overloaded if they're both overloaded */
+	if (b->eff_util > b->cap_max && a->eff_util > a->cap_max &&
+	    cass_cmp(b->eff_util * SCHED_CAPACITY_SCALE / b->cap_max,
+		     a->eff_util * SCHED_CAPACITY_SCALE / a->cap_max))
+		goto done;
 
 	/* Prefer the CPU that fits the task */
 	if (cass_cmp(fits_capacity_cpu(p_util, a->cpu),
@@ -242,17 +259,12 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			 * A non-idle candidate may be better when @p is uclamp
 			 * boosted. Otherwise, always prefer idle candidates.
 			 */
-			if (!uc_min) {
-				/*
-				 * Discard any previous non-idle candidate.
-				 * Don't treat the prime CPU as an idle fallback,
-				 * so that a busier non-prime CPU can still win
-				 * via cass_cpu_better().
-				 */
-				if (!has_idle && !cass_prime_cpu(curr)) {
-					best = curr;
-					has_idle = true;
-				}
+			if (!has_idle &&
+			    uc_min <= arch_scale_min_freq_capacity(cpu) &&
+			    !cass_prime_cpu(curr)) {
+				/* Discard any previous non-idle candidate */
+				best = curr;
+				has_idle = true;
 			}
 
 			/* Nonzero exit latency indicates this CPU is idle */
@@ -282,12 +294,34 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		if (cpu != task_cpu(p))
 			curr->util += p_util;
 
+		/*
+		 * Calculate the effective utilization for this CPU candidate;
+		 * i.e., the utilization calculated by the CPU governor. This is
+		 * needed to evaluate whether or not a throttled CPU is
+		 * overloaded, since the relative utilization calculation
+		 * disregards thermal pressure.
+		 */
+		curr->eff_util = max(curr->util + curr->hard_util, uc_min);
+
 		/* Clamp the utilization to the minimum performance threshold */
 		if (curr->util < uc_min)
 			curr->util = uc_min;
 
-		/* Calculate the relative utilization for this CPU candidate */
-		curr->util = curr->util * SCHED_CAPACITY_SCALE / curr->cap;
+		/*
+		 * Calculate the relative utilization for this CPU candidate
+		 * without thermal pressure included. Thermal pressure needs to
+		 * be disregarded in order to fairly distribute load such that
+		 * higher P-states aren't pushed on CPUs that are throttled to a
+		 * lesser degree. For example, if CPU A were throttled to 50% of
+		 * its maximum possible capacity, and CASS targeted 20% relative
+		 * load on all CPUs, CPU A would receive (20% * 50%) = 10% load
+		 * relative to its maximum possible P-state. This burden would
+		 * then be redistributed to other CPUs, causing a load imbalance
+		 * that would reduce CASS's energy efficiency due to
+		 * disproportionate P-states.
+		 */
+		curr->util =
+			curr->util * SCHED_CAPACITY_SCALE / curr->cap_no_therm;
 
 		/*
 		 * Check if this CPU is better than the best CPU found so far.
