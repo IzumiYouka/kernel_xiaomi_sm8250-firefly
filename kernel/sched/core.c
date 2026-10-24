@@ -635,29 +635,26 @@ void wake_up_nohz_cpu(int cpu)
 		wake_up_idle_cpu(cpu);
 }
 
-static inline bool got_nohz_idle_kick(void)
+/*
+ * Runs as a regular smp function call on @rq's CPU. Releasing the csd here,
+ * rather than in scheduler_ipi(), is what serializes reuse of rq::nohz_csd:
+ * smp_call_function_single_async() returns -EBUSY on reuse, but that check
+ * is not atomic, so the release has to sit in the callback.
+ */
+static void nohz_csd_func(void *info)
 {
-	int cpu = smp_processor_id();
+	struct rq *rq = info;
+	int cpu = cpu_of(rq);
+	unsigned int flags;
 
-	if (!(atomic_read(nohz_flags(cpu)) & NOHZ_KICK_MASK))
-		return false;
+	flags = atomic_fetch_andnot(NOHZ_KICK_MASK, nohz_flags(cpu));
+	WARN_ON(!(flags & NOHZ_KICK_MASK));
 
-	if (idle_cpu(cpu) && !need_resched())
-		return true;
-
-	/*
-	 * We can't run Idle Load Balance on this CPU for this time so we
-	 * cancel it and clear NOHZ_BALANCE_KICK
-	 */
-	atomic_andnot(NOHZ_KICK_MASK, nohz_flags(cpu));
-	return false;
-}
-
-#else /* CONFIG_NO_HZ_COMMON */
-
-static inline bool got_nohz_idle_kick(void)
-{
-	return false;
+	rq->idle_balance = idle_cpu(cpu);
+	if (rq->idle_balance && !need_resched()) {
+		rq->nohz_idle_balance = flags;
+		raise_softirq_irqoff(SCHED_SOFTIRQ);
+	}
 }
 
 #endif /* CONFIG_NO_HZ_COMMON */
@@ -2824,7 +2821,6 @@ void sched_ttwu_pending(void)
 
 void scheduler_ipi(void)
 {
-	int cpu = smp_processor_id();
 	/*
 	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
 	 * TIF_NEED_RESCHED remotely (for the first time) will also send
@@ -2832,7 +2828,7 @@ void scheduler_ipi(void)
 	 */
 	preempt_fold_need_resched();
 
-	if (llist_empty(&this_rq()->wake_list) && !got_nohz_idle_kick())
+	if (llist_empty(&this_rq()->wake_list))
 		return;
 
 	/*
@@ -2850,14 +2846,6 @@ void scheduler_ipi(void)
 	 */
 	irq_enter();
 	sched_ttwu_pending();
-
-	/*
-	 * Check if someone kicked us for doing the nohz idle load balance.
-	 */
-	if (unlikely(got_nohz_idle_kick()) && !cpu_isolated(cpu)) {
-		this_rq()->idle_balance = 1;
-		raise_softirq_irqoff(SCHED_SOFTIRQ);
-	}
 	irq_exit();
 }
 
@@ -7759,6 +7747,10 @@ void __init sched_init(void)
 		rq->last_load_update_tick = jiffies;
 		rq->last_blocked_load_update_tick = jiffies;
 		atomic_set(&rq->nohz_flags, 0);
+
+		rq->nohz_csd.flags = 0;
+		rq->nohz_csd.func = nohz_csd_func;
+		rq->nohz_csd.info = rq;
 #endif
 #endif /* CONFIG_SMP */
 		hrtick_rq_init(rq);

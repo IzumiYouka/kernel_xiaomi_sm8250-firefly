@@ -12084,94 +12084,23 @@ static inline int on_null_domain(struct rq *rq)
 }
 
 #ifdef CONFIG_NO_HZ_COMMON
-static inline int find_energy_aware_new_ilb(void)
-{
-	int ilb = nr_cpu_ids;
-	struct sched_domain *sd;
-	int cpu = raw_smp_processor_id();
-	cpumask_t idle_cpus, tmp_cpus;
-	struct sched_group *sg;
-	unsigned long ref_cap = capacity_orig_of(cpu);
-	unsigned long best_cap = 0, best_cap_cpu = -1;
-
-	rcu_read_lock();
-	sd = rcu_dereference(per_cpu(sd_asym_cpucapacity, cpu));
-	if (!sd)
-		goto out;
-
-	cpumask_and(&idle_cpus, nohz.idle_cpus_mask,
-			housekeeping_cpumask(HK_FLAG_MISC));
-	cpumask_andnot(&idle_cpus, &idle_cpus, cpu_isolated_mask);
-
-	sg = sd->groups;
-	do {
-		int i;
-		unsigned long cap;
-
-		cpumask_and(&tmp_cpus, &idle_cpus, sched_group_span(sg));
-		i = cpumask_first(&tmp_cpus);
-
-		/* This sg did not have any idle CPUs */
-		if (i >= nr_cpu_ids)
-			continue;
-
-		cap = capacity_orig_of(i);
-
-		/* The first preference is for the same capacity CPU */
-		if (cap == ref_cap) {
-			ilb = i;
-			break;
-		}
-
-		/*
-		 * When there are no idle CPUs in the same capacity group,
-		 * we find the next best capacity CPU.
-		 */
-		if (best_cap > ref_cap) {
-			if (cap > ref_cap && cap < best_cap) {
-				best_cap = cap;
-				best_cap_cpu = i;
-			}
-			continue;
-		}
-
-		if (cap > best_cap) {
-			best_cap = cap;
-			best_cap_cpu = i;
-		}
-
-	} while (sg = sg->next, sg != sd->groups);
-
-	if (best_cap_cpu != -1)
-		ilb = best_cap_cpu;
-out:
-	rcu_read_unlock();
-	return ilb;
-}
-
-/*
- * idle load balancing details
- * - When one of the busy CPUs notice that there may be an idle rebalancing
- *   needed, they will kick the idle load balancer, which then does idle
- *   load balancing for all the idle CPUs.
- * - HK_FLAG_MISC CPUs are used for this task, because HK_FLAG_SCHED not set
- *   anywhere yet.
- */
-
 static inline int find_new_ilb(void)
 {
-	int ilb;
+	int ilb, this_cpu = smp_processor_id();
+	const struct cpumask *hk_mask;
 
-	if (static_branch_likely(&sched_energy_present))
-		return find_energy_aware_new_ilb();
+	hk_mask = housekeeping_cpumask(HK_FLAG_MISC);
 
-	for_each_cpu_and(ilb, nohz.idle_cpus_mask,
-			      housekeeping_cpumask(HK_FLAG_MISC)) {
+	for_each_cpu_and(ilb, nohz.idle_cpus_mask, hk_mask) {
+
+		if (ilb == this_cpu)
+			continue;
+
 		if (idle_cpu(ilb))
 			return ilb;
 	}
 
-	return nr_cpu_ids;
+	return -1;
 }
 
 /*
@@ -12191,7 +12120,7 @@ static void kick_ilb(unsigned int flags)
 
 	ilb_cpu = find_new_ilb();
 
-	if (ilb_cpu >= nr_cpu_ids)
+	if (ilb_cpu < 0)
 		return;
 
 	/*
@@ -12206,13 +12135,12 @@ static void kick_ilb(unsigned int flags)
 		return;
 
 	/*
-	 * Use smp_send_reschedule() instead of resched_cpu().
-	 * This way we generate a sched IPI on the target CPU which
+	 * This way we generate an IPI on the target CPU which
 	 * is idle. And the softirq performing nohz idle load balance
 	 * will be run before returning from the IPI.
 	 */
 	trace_sched_load_balance_nohz_kick(smp_processor_id(), ilb_cpu);
-	smp_send_reschedule(ilb_cpu);
+	smp_call_function_single_async(ilb_cpu, &cpu_rq(ilb_cpu)->nohz_csd);
 }
 
 /*
@@ -12555,22 +12483,14 @@ abort:
  */
 static bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle)
 {
-	int this_cpu = this_rq->cpu;
-	unsigned int flags;
+	unsigned int flags = this_rq->nohz_idle_balance;
 
-	if (!(atomic_read(nohz_flags(this_cpu)) & NOHZ_KICK_MASK))
+	if (!flags)
 		return false;
 
-	if (idle != CPU_IDLE) {
-		atomic_andnot(NOHZ_KICK_MASK, nohz_flags(this_cpu));
-		return false;
-	}
+	this_rq->nohz_idle_balance = 0;
 
-	/*
-	 * barrier, pairs with nohz_balance_enter_idle(), ensures ...
-	 */
-	flags = atomic_fetch_andnot(NOHZ_KICK_MASK, nohz_flags(this_cpu));
-	if (!(flags & NOHZ_KICK_MASK))
+	if (idle != CPU_IDLE)
 		return false;
 
 	_nohz_idle_balance(this_rq, flags, idle);

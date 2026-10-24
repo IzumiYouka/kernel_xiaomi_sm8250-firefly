@@ -995,7 +995,10 @@ struct rq {
 	unsigned int		has_blocked_load;
 #endif /* CONFIG_SMP */
 	unsigned int		nohz_tick_stopped;
-	atomic_t nohz_flags;
+	atomic_t		nohz_flags;
+
+	/* Release point for the nohz idle-balance IPI, see nohz_csd_func() */
+	call_single_data_t	nohz_csd;
 #endif /* CONFIG_NO_HZ_COMMON */
 
 	unsigned long		nr_load_updates;
@@ -1057,6 +1060,7 @@ struct rq {
 	struct callback_head	*balance_callback;
 
 	unsigned char		idle_balance;
+	unsigned char		nohz_idle_balance;
 
 	unsigned long		misfit_task_load;
 
